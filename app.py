@@ -6,6 +6,7 @@ from openai import OpenAI
 import requests
 from io import BytesIO
 import os
+from urllib.parse import quote
 
 # -----------------------------
 # Optional deps (URL / PDF input)
@@ -57,9 +58,9 @@ except Exception:
 
 
 # -----------------------------
-# Page config
+# Page config (no emojis)
 # -----------------------------
-st.set_page_config(page_title="العِلم بالعربية", page_icon="🧠", layout="wide")
+st.set_page_config(page_title="العِلم بالعربية", layout="wide")
 
 # -----------------------------
 # Styling (RTL)
@@ -94,12 +95,16 @@ st.markdown(
         margin: 8px 0 14px 0;
       }
       code { direction:ltr; text-align:left; }
+      a { text-decoration: none; }
+      .sources a { display:inline-block; margin-inline-start: 10px; }
+      .mini { font-size:0.9rem; opacity:0.88; }
+      .hr { height:1px; background:rgba(255,255,255,0.08); margin:10px 0; border-radius:1px; }
     </style>
     """,
     unsafe_allow_html=True
 )
 
-st.markdown("<h1 class='center'>🧠 العِلم بالعربية</h1>", unsafe_allow_html=True)
+st.markdown("<h1 class='center'>العِلم بالعربية</h1>", unsafe_allow_html=True)
 st.markdown(
     "<p class='center muted'>مصطلحات علمية حسب التخصص + ترجمة ورقة بحثية كاملة (نص/رابط/PDF) + تحميل PDF</p>",
     unsafe_allow_html=True
@@ -190,7 +195,6 @@ def normalize_spaces(s: str) -> str:
 # PDF export helpers (ReportLab) + Arabic shaping
 # -----------------------------
 def _shape_arabic_for_pdf(s: str) -> str:
-    # For correct Arabic: reshape + bidi display
     if HAS_RESHAPER and HAS_BIDI:
         try:
             return get_display(arabic_reshaper.reshape(s))
@@ -199,11 +203,6 @@ def _shape_arabic_for_pdf(s: str) -> str:
     return s
 
 def _register_arabic_font():
-    """
-    حاول تسجيل خط عربي:
-    - الأفضل: fonts/Amiri-Regular.ttf
-    - ثم محاولات شائعة في الأنظمة
-    """
     if not HAS_REPORTLAB:
         return None
 
@@ -224,9 +223,6 @@ def _register_arabic_font():
     return None
 
 def _wrap_lines(text: str, font_name: str, font_size: int, max_width: float) -> list[str]:
-    """
-    لفّ النص إلى أسطر بحيث لا يتجاوز العرض.
-    """
     lines_out = []
     for para in (text or "").splitlines():
         if not para.strip():
@@ -253,11 +249,6 @@ def _wrap_lines(text: str, font_name: str, font_size: int, max_width: float) -> 
     return lines_out
 
 def build_pdf_bytes(title: str, text: str) -> bytes:
-    """
-    يبني PDF:
-    - محاذاة يمين
-    - تشكيل عربي إذا توفر arabic_reshaper + python-bidi
-    """
     if not HAS_REPORTLAB:
         raise RuntimeError("reportlab غير مثبتة. ثبّتها عبر: python3 -m pip install reportlab")
 
@@ -274,13 +265,11 @@ def build_pdf_bytes(title: str, text: str) -> bytes:
     title_size = 14
     line_gap = 18
 
-    # Title
     c.setFont(font_name, title_size)
     shaped_title = _shape_arabic_for_pdf(title) if title else ""
     c.drawRightString(x_right, y, shaped_title)
     y -= (line_gap + 6)
 
-    # Body
     c.setFont(font_name, font_size)
     max_width = width - 2 * margin
 
@@ -425,7 +414,68 @@ def scientific_score(term: str, bonus_regex: str) -> int:
 
     return score
 
-def normalize_terms(raw_terms: list, text: str, bonus_regex: str) -> list:
+# -----------------------------
+# Sources (auto + verified)
+# -----------------------------
+def build_source_candidates(term: str, preset: str) -> list[dict]:
+    t = normalize_spaces(term)
+    q = quote(t)
+    wiki_title = quote(t.replace(" ", "_"))
+
+    cands = [
+        {"title": "Wikipedia (EN)", "url": f"https://en.wikipedia.org/wiki/{wiki_title}"},
+        {"title": "Wikipedia Search (AR)", "url": f"https://ar.wikipedia.org/wiki/Special:Search?search={q}"},
+        {"title": "NCBI Bookshelf", "url": f"https://www.ncbi.nlm.nih.gov/books/?term={q}"},
+        {"title": "MeSH (NLM)", "url": f"https://meshb.nlm.nih.gov/search?searchInField=termDescriptor&searchType=exactMatch&searchMethod=FullWord&searchTerm={q}"},
+        {"title": "PubChem", "url": f"https://pubchem.ncbi.nlm.nih.gov/#query={q}"},
+    ]
+
+    if preset in ("بحري", "بيئي", "شامل"):
+        cands.append({"title": "NOAA Search", "url": f"https://oceanservice.noaa.gov/search.html?q={q}"})
+    if preset in ("طبي", "شامل"):
+        cands.append({"title": "MedlinePlus Search", "url": f"https://medlineplus.gov/search/?query={q}"})
+    if preset in ("فيزيائي", "شامل"):
+        cands.append({"title": "NASA Search", "url": f"https://www.nasa.gov/search/?query={q}"})
+
+    seen = set()
+    out = []
+    for c in cands:
+        if c["url"] not in seen:
+            out.append(c)
+            seen.add(c["url"])
+    return out
+
+@st.cache_data(show_spinner=False, ttl=60 * 60)
+def url_is_live(url: str) -> bool:
+    try:
+        r = requests.head(url, allow_redirects=True, timeout=6)
+        if 200 <= r.status_code < 400:
+            return True
+    except Exception:
+        pass
+    try:
+        r = requests.get(url, allow_redirects=True, timeout=6)
+        return 200 <= r.status_code < 400
+    except Exception:
+        return False
+
+def pick_sources(term: str, preset: str, max_links: int = 3) -> list[dict]:
+    cands = build_source_candidates(term, preset)
+    picked = []
+    for c in cands:
+        if url_is_live(c["url"]):
+            picked.append(c)
+        if len(picked) >= max_links:
+            break
+    if len(picked) < max_links:
+        for c in cands:
+            if c not in picked:
+                picked.append(c)
+            if len(picked) >= max_links:
+                break
+    return picked[:max_links]
+
+def normalize_terms(raw_terms: list, text: str, bonus_regex: str, preset: str) -> list:
     buckets = {}
     for t in raw_terms or []:
         term = (t.get("term") or "").strip()
@@ -442,8 +492,10 @@ def normalize_terms(raw_terms: list, text: str, bonus_regex: str) -> list:
             "arabic": (t.get("arabic") or "").strip(),
             "category": (t.get("category") or "").strip(),
             "definition": (t.get("definition") or "").strip(),
+            "definition_en": (t.get("definition_en") or "").strip(),
             "example": (t.get("example") or "").strip(),
             "occurrences": [],
+            "sources": [],
         }
 
         occs = validate_occurrences(text, term, t.get("occurrences") or [])
@@ -453,6 +505,8 @@ def normalize_terms(raw_terms: list, text: str, bonus_regex: str) -> list:
         if not occs:
             continue
         item["occurrences"] = occs
+
+        item["sources"] = pick_sources(term, preset=preset, max_links=3)
 
         if key not in buckets:
             buckets[key] = item
@@ -469,10 +523,19 @@ def normalize_terms(raw_terms: list, text: str, bonus_regex: str) -> list:
                 buckets[key]["arabic"] = item["arabic"]
             if len(item["definition"]) > len(buckets[key]["definition"]):
                 buckets[key]["definition"] = item["definition"]
+            if len(item["definition_en"]) > len(buckets[key]["definition_en"]):
+                buckets[key]["definition_en"] = item["definition_en"]
             if len(item["example"]) > len(buckets[key]["example"]):
                 buckets[key]["example"] = item["example"]
             if item["category"] and not buckets[key]["category"]:
                 buckets[key]["category"] = item["category"]
+
+            seen_urls = {s["url"] for s in (buckets[key]["sources"] or []) if "url" in s}
+            for s in item["sources"] or []:
+                if s.get("url") and s["url"] not in seen_urls:
+                    buckets[key]["sources"].append(s)
+                    seen_urls.add(s["url"])
+            buckets[key]["sources"] = (buckets[key]["sources"] or [])[:4]
 
     out = []
     for v in buckets.values():
@@ -517,16 +580,36 @@ def render_term_card(item: dict):
     term = (item.get("term") or "").strip()
     ar = (item.get("arabic") or "").strip()
     definition = (item.get("definition") or "").strip()
+    definition_en = (item.get("definition_en") or "").strip()
     example = (item.get("example") or "").strip()
     category = (item.get("category") or "").strip()
+    sources = item.get("sources") or []
+
+    sources_html = ""
+    if sources:
+        links = []
+        for s in sources[:4]:
+            title = html.escape(s.get("title") or "Source")
+            url = html.escape(s.get("url") or "#")
+            links.append(f"<a href='{url}' target='_blank'>{title}</a>")
+        sources_html = (
+            "<div class='hr'></div>"
+            "<p class='mini'><b>المصادر:</b> <span class='sources'>" + " ".join(links) + "</span></p>"
+        )
 
     st.markdown(
         f"""
         <div class="card rtl">
-          <h3>📌 {html.escape(term)} {f"<span class='tag'>{html.escape(category)}</span>" if category else ""}</h3>
+          <h3>{html.escape(term)} {f"<span class='tag'>{html.escape(category)}</span>" if category else ""}</h3>
           <p><b>الترجمة العربية:</b> {html.escape(ar) if ar else "—"}</p>
-          <p><b>التعريف:</b> {html.escape(definition) if definition else "—"}</p>
-          {f"<p><b>مثال في نفس السياق:</b> {html.escape(example)}</p>" if example else ""}
+          <div class='hr'></div>
+          <p><b>التعريف بالعربية:</b> {html.escape(definition) if definition else "—"}</p>
+          <div class='hr'></div>
+          <p><b>Definition (English):</b>
+             <span style="direction:ltr; text-align:left; display:block;">{html.escape(definition_en) if definition_en else "—"}</span>
+          </p>
+          {f"<div class='hr'></div><p><b>مثال في نفس السياق:</b> {html.escape(example)}</p>" if example else ""}
+          {sources_html}
         </div>
         """,
         unsafe_allow_html=True
@@ -615,11 +698,10 @@ def translate_full_text_to_ar(text: str) -> str:
         outputs.append(out)
     return "\n\n".join(outputs).strip()
 
-
 # -----------------------------
 # UI: Tabs
 # -----------------------------
-tab1, tab2 = st.tabs(["🔎 استخراج المصطلحات", "🌍 ترجمة ورقة بحثية كاملة"])
+tab1, tab2 = st.tabs(["استخراج المصطلحات", "ترجمة ورقة بحثية كاملة"])
 
 # -----------------------------
 # Tab 1: Terms extraction
@@ -632,9 +714,9 @@ with tab1:
 
     c1, c2 = st.columns([1, 1])
     with c1:
-        run_terms = st.button("🧠 استخراج المصطلحات وتحديدها", key="run_terms")
+        run_terms = st.button("استخراج المصطلحات وتحديدها", key="run_terms")
     with c2:
-        clear_terms = st.button("🧹 مسح", key="clear_terms")
+        clear_terms = st.button("مسح", key="clear_terms")
 
     if clear_terms:
         for k in ["terms", "highlighted"]:
@@ -651,7 +733,8 @@ with tab1:
                 "المطلوب:\n"
                 "- استخرج المصطلحات العلمية/التقنية المهمة فقط (تشمل الكلمات الواحدة مثل eutrophication).\n"
                 "- أعطِ ترجمة عربية دقيقة قدر الإمكان.\n"
-                "- التعريف: 3 إلى 6 جمل قصيرة واضحة (بدون كتابة: 'المصطلح X هو').\n"
+                "- التعريف بالعربية: 3 إلى 6 جمل قصيرة واضحة (بدون كتابة: 'المصطلح X هو').\n"
+                "- التعريف بالإنجليزية: 3 إلى 6 جمل قصيرة واضحة.\n"
                 "- مثال قصير مرتبط بسياق النص.\n"
                 "- مهم جداً: أعِد مواضع المصطلح داخل النص بدقة عبر start/end (0-based) بحيث text[start:end] يطابق ظهور المصطلح.\n"
                 "- أعطِ حتى 6 occurrences.\n\n"
@@ -663,6 +746,7 @@ with tab1:
                 "\"arabic\":\"\","
                 "\"category\":\"\","
                 "\"definition\":\"\","
+                "\"definition_en\":\"\","
                 "\"example\":\"\","
                 "\"occurrences\":[{\"start\":0,\"end\":0}]"
                 "}"
@@ -683,7 +767,7 @@ with tab1:
                 st.warning("ما لقيت مصطلحات واضحة. جرّب فقرة علمية أكثر.")
                 st.stop()
 
-            terms = normalize_terms(raw_terms, article, cfg["bonus_regex"])
+            terms = normalize_terms(raw_terms, article, cfg["bonus_regex"], preset=preset)
 
             if not terms:
                 st.warning("لم أستطع استخراج مصطلحات علمية واضحة من النص الحالي. جرّب فقرة أكثر تخصصاً.")
@@ -695,10 +779,10 @@ with tab1:
     terms = st.session_state.get("terms")
     highlighted = st.session_state.get("highlighted")
     if terms and highlighted:
-        st.markdown("<div class='rtl'><h2>🖍️ النص مع تحديد المصطلحات</h2></div>", unsafe_allow_html=True)
+        st.markdown("<div class='rtl'><h2>النص مع تحديد المصطلحات</h2></div>", unsafe_allow_html=True)
         st.markdown(highlighted, unsafe_allow_html=True)
 
-        st.markdown("<div class='rtl'><h2>✅ شرح المصطلحات</h2></div>", unsafe_allow_html=True)
+        st.markdown("<div class='rtl'><h2>شرح المصطلحات</h2></div>", unsafe_allow_html=True)
         for t in terms:
             render_term_card(t)
 
@@ -710,13 +794,13 @@ with tab2:
 
     missing_msgs = []
     if not HAS_BS4:
-        missing_msgs.append("ميزة **رابط URL** تحتاج: `beautifulsoup4`")
+        missing_msgs.append("ميزة رابط URL تحتاج: beautifulsoup4")
     if not HAS_PYPDF:
-        missing_msgs.append("ميزة **PDF (استخراج نص)** تحتاج: `pypdf`")
+        missing_msgs.append("ميزة PDF (استخراج نص) تحتاج: pypdf")
     if not HAS_REPORTLAB:
-        missing_msgs.append("ميزة **تحميل PDF** تحتاج: `reportlab`")
+        missing_msgs.append("ميزة تحميل PDF تحتاج: reportlab")
     if HAS_REPORTLAB and (not HAS_RESHAPER or not HAS_BIDI):
-        missing_msgs.append("لأفضل PDF عربي: ثبّت `arabic-reshaper` و `python-bidi` (موصى به)")
+        missing_msgs.append("لأفضل PDF عربي: ثبّت arabic-reshaper و python-bidi (موصى به)")
 
     if missing_msgs:
         st.markdown(
@@ -741,7 +825,7 @@ with tab2:
     elif input_method == "رابط URL":
         url = st.text_input("ضع رابط الورقة/المقال:")
         fetch_disabled = not HAS_BS4
-        if st.button("📥 جلب النص من الرابط", disabled=fetch_disabled):
+        if st.button("جلب النص من الرابط", disabled=fetch_disabled):
             if not url.strip():
                 st.warning("اكتب الرابط أولاً.")
             else:
@@ -756,10 +840,10 @@ with tab2:
         if source_text:
             st.text_area("النص المستخرج (يمكنك تعديله قبل الترجمة):", value=source_text, height=220)
 
-    else:  # PDF input
+    else:
         pdf = st.file_uploader("ارفع ملف PDF:", type=["pdf"])
         extract_disabled = not HAS_PYPDF
-        if pdf is not None and st.button("📄 استخراج النص من PDF", disabled=extract_disabled):
+        if pdf is not None and st.button("استخراج النص من PDF", disabled=extract_disabled):
             with st.spinner("جاري استخراج النص..."):
                 try:
                     source_text = extract_text_from_pdf(pdf)
@@ -773,9 +857,9 @@ with tab2:
 
     colA, colB = st.columns([1, 1])
     with colA:
-        do_translate = st.button("🌍 ترجمة كاملة إلى العربية")
+        do_translate = st.button("ترجمة كاملة إلى العربية")
     with colB:
-        clear_paper = st.button("🧹 مسح الورقة")
+        clear_paper = st.button("مسح الورقة")
 
     if clear_paper:
         st.session_state.pop("paper_text", None)
@@ -793,7 +877,6 @@ with tab2:
                     ar_raw = translate_full_text_to_ar(text_to_translate)
                     st.session_state["paper_translation_raw"] = ar_raw
 
-                    # Pre-build PDF bytes if possible
                     if HAS_REPORTLAB:
                         pdf_bytes = build_pdf_bytes("الترجمة العربية", ar_raw)
                         st.session_state["paper_pdf_bytes"] = pdf_bytes
@@ -807,17 +890,17 @@ with tab2:
     pdf_bytes = st.session_state.get("paper_pdf_bytes")
 
     if ar_raw:
-        st.markdown("<div class='rtl'><h2>✅ الترجمة العربية</h2></div>", unsafe_allow_html=True)
+        st.markdown("<div class='rtl'><h2>الترجمة العربية</h2></div>", unsafe_allow_html=True)
         st.text_area("الترجمة:", value=ar_raw, height=360)
 
         if HAS_REPORTLAB and pdf_bytes:
             st.download_button(
-                "⬇️ تحميل PDF",
+                "تحميل PDF",
                 data=pdf_bytes,
                 file_name="translation_ar.pdf",
                 mime="application/pdf"
             )
             if not (HAS_RESHAPER and HAS_BIDI):
-                st.info("ملاحظة: قد لا تكون الحروف العربية متصلة تمامًا في PDF إلا بعد تثبيت arabic-reshaper و python-bidi ووضع خط عربي (مثل Amiri).")
+                st.info("قد لا تكون الحروف العربية متصلة تمامًا في PDF إلا بعد تثبيت arabic-reshaper و python-bidi ووضع خط عربي (مثل Amiri).")
         else:
             st.warning("ميزة تحميل PDF غير متاحة حالياً. ثبّت reportlab.")

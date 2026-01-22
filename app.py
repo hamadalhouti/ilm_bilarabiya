@@ -106,7 +106,7 @@ st.markdown(
 
 st.markdown("<h1 class='center'>العِلم بالعربية</h1>", unsafe_allow_html=True)
 st.markdown(
-    "<p class='center muted'>مصطلحات علمية حسب التخصص + ترجمة ورقة بحثية كاملة (نص/رابط/PDF) + تحميل PDF</p>",
+    "<p class='center muted'>نحو معرفة علمية دقيقة بلغة عربية</p>",
     unsafe_allow_html=True
 )
 st.divider()
